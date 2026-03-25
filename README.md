@@ -1,6 +1,6 @@
 <div align="center">
-<img src="https://github.com/user-attachments/assets/4a5c06ab-c1bb-4d9c-9173-1fd330763a59" width="250">
-  
+<img  height="120" alt="result" src="https://github.com/user-attachments/assets/c66cbd02-4491-4833-a63a-142cfd7530c1" />
+
 # pi-autoresearch
 ### Autonomous experiment loop for pi
 **[Install](#install)** · **[Usage](#usage)** · **[How it works](#how-it-works)**
