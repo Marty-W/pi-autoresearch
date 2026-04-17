@@ -8,14 +8,21 @@ description: Finalize an autoresearch session into clean, reviewable branches. U
 
 Turn a noisy autoresearch branch into clean, independent branches — one per logical change, each starting from the merge-base.
 
+## Important: current backend support
+
+- This finalize flow is currently **git-only**.
+- If the repo contains `.jj/`, stop and tell the user that core autoresearch loop support works in jj mode, but finalize has not been ported yet.
+- In jj repos, do **not** try to run `finalize.sh`, do **not** invent a partial git fallback, and instead summarize the kept experiments plus the current state for manual follow-up.
+
 ## Step 1 — Analyze and Propose Groups
 
-1. Read `autoresearch.jsonl`. Filter to **kept** experiments only.
-2. Read `autoresearch.md` for context.
-3. Expand all short commit hashes to full hashes: `git rev-parse <short_hash>`
-4. Get the merge-base: `git merge-base HEAD main`
-5. For each kept commit, get the diff stat (use `$BASE..<commit>` for the first, `<prev_kept>..<commit>` for subsequent).
-6. Group kept commits into logical changesets:
+1. First verify this is a git repo for finalize purposes. If `.jj/` is present, stop and explain that finalize is not yet supported in jj mode.
+2. Read `autoresearch.jsonl`. Filter to **kept** experiments only.
+3. Read `autoresearch.md` for context.
+4. Expand all short commit hashes to full hashes: `git rev-parse <short_hash>`
+5. Get the merge-base: `git merge-base HEAD main`
+6. For each kept commit, get the diff stat (use `$BASE..<commit>` for the first, `<prev_kept>..<commit>` for subsequent).
+7. Group kept commits into logical changesets:
    - **Preserve application order.** Group N comes before Group N+1.
    - **No two groups may touch the same file.** Each branch is applied to merge-base independently — overlapping files would conflict. If two groups touch the same file, merge them into one group.
    - **Watch for cross-file dependencies.** Each branch is independent, so if group 1 adds an API in `api.js` and group 2 calls it in `parser.js`, group 2's branch won't work in isolation. When proposing groups, flag dependencies: "group 2 depends on group 1 — review together." If the dependency is tight, merge the groups.

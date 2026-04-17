@@ -182,7 +182,7 @@ const InitParams = Type.Object({
 });
 
 const LogParams = Type.Object({
-  commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
+  commit: Type.String({ description: "Short revision identifier for this run (git commit hash, jj change id, etc.)" }),
   metric: Type.Number({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
@@ -505,6 +505,20 @@ function validateWorkDir(ctxCwd: string): string | null {
     return `workingDir "${workDir}" (from autoresearch.config.json) does not exist.`;
   }
   return null;
+}
+
+type VcsBackendKind = "git" | "jj";
+
+function detectVcs(workDir: string): VcsBackendKind {
+  let dir = workDir;
+  while (true) {
+    if (fs.existsSync(path.join(dir, ".jj"))) return "jj";
+    if (fs.existsSync(path.join(dir, ".git"))) return "git";
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return "git";
 }
 
 /** Baseline = first experiment in current segment */
@@ -988,6 +1002,154 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
+  type KeepResult = {
+    displayRevision: string;
+    message: string;
+  };
+
+  type RepoVcs = {
+    kind: VcsBackendKind;
+    historyLabel: string;
+    keep: (workDir: string, commitMsg: string) => Promise<KeepResult>;
+    discard: (workDir: string, protectedFiles: string[], status: ExperimentResult["status"]) => Promise<string>;
+  };
+
+  const getRepoVcs = (workDir: string): RepoVcs => {
+    const kind = detectVcs(workDir);
+
+    if (kind === "jj") {
+      return {
+        kind,
+        historyLabel: "jj log",
+        keep: async (cwd, commitMsg) => {
+          const diffResult = await pi.exec("jj", ["diff", "--summary"], { cwd, timeout: 10000 });
+          if (diffResult.code !== 0) {
+            const err = (diffResult.stdout + diffResult.stderr).trim();
+            throw new Error(`jj diff failed (exit ${diffResult.code}): ${err.slice(0, 200)}`);
+          }
+
+          if (!(diffResult.stdout + diffResult.stderr).trim()) {
+            return {
+              displayRevision: "",
+              message: "Jujutsu: nothing to keep (working copy clean)",
+            };
+          }
+
+          const descResult = await pi.exec("jj", ["desc", "-m", commitMsg], { cwd, timeout: 10000 });
+          if (descResult.code !== 0) {
+            const err = (descResult.stdout + descResult.stderr).trim();
+            throw new Error(`jj desc failed (exit ${descResult.code}): ${err.slice(0, 200)}`);
+          }
+
+          let displayRevision = "";
+          const idResult = await pi.exec(
+            "jj",
+            ["log", "-r", "@", "-T", "change_id.short() ++ \"|\" ++ commit_id.short()"],
+            { cwd, timeout: 5000 }
+          );
+          if (idResult.code === 0) {
+            const [changeId] = (idResult.stdout || "").trim().split("|");
+            if (changeId) displayRevision = changeId.slice(0, 7);
+          }
+
+          const newResult = await pi.exec("jj", ["new", "-m", "autoresearch: next experiment"], { cwd, timeout: 10000 });
+          if (newResult.code !== 0) {
+            const err = (newResult.stdout + newResult.stderr).trim();
+            return {
+              displayRevision,
+              message: `Jujutsu: kept ${displayRevision || "change"}, but failed to open a fresh working-copy change (exit ${newResult.code}): ${err.slice(0, 200)}`,
+            };
+          }
+
+          return {
+            displayRevision,
+            message: `Jujutsu: kept ${displayRevision || "change"} and opened a fresh working-copy change`,
+          };
+        },
+        discard: async (cwd, protectedFiles, status) => {
+          const snapshotDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-jj-"));
+          const existingFiles: string[] = [];
+
+          try {
+            for (const file of protectedFiles) {
+              const src = path.join(cwd, file);
+              if (!fs.existsSync(src)) continue;
+              const dest = path.join(snapshotDir, file);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              fs.copyFileSync(src, dest);
+              existingFiles.push(file);
+            }
+
+            const restoreResult = await pi.exec("jj", ["restore", "."], { cwd, timeout: 10000 });
+            if (restoreResult.code !== 0) {
+              const err = (restoreResult.stdout + restoreResult.stderr).trim();
+              throw new Error(`jj restore failed (exit ${restoreResult.code}): ${err.slice(0, 200)}`);
+            }
+
+            for (const file of existingFiles) {
+              fs.copyFileSync(path.join(snapshotDir, file), path.join(cwd, file));
+            }
+
+            return `Jujutsu: reverted changes (${status}) — autoresearch files preserved`;
+          } finally {
+            fs.rmSync(snapshotDir, { recursive: true, force: true });
+          }
+        },
+      };
+    }
+
+    return {
+      kind,
+      historyLabel: "git log",
+      keep: async (cwd, commitMsg) => {
+        const addResult = await pi.exec("git", ["add", "-A"], { cwd, timeout: 10000 });
+        if (addResult.code !== 0) {
+          const addErr = (addResult.stdout + addResult.stderr).trim();
+          throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+        }
+
+        const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], { cwd, timeout: 10000 });
+        if (diffResult.code === 0) {
+          return {
+            displayRevision: "",
+            message: "Git: nothing to commit (working tree clean)",
+          };
+        }
+
+        const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], { cwd, timeout: 10000 });
+        const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
+        if (gitResult.code !== 0) {
+          return {
+            displayRevision: "",
+            message: `⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`,
+          };
+        }
+
+        let displayRevision = "";
+        try {
+          const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd, timeout: 5000 });
+          const newSha = (shaResult.stdout || "").trim();
+          if (newSha && newSha.length >= 7) {
+            displayRevision = newSha;
+          }
+        } catch {
+          // Keep displayRevision empty if rev-parse fails
+        }
+
+        const firstLine = gitOutput.split("\n")[0] || "";
+        return {
+          displayRevision,
+          message: `Git: committed — ${firstLine}`,
+        };
+      },
+      discard: async (cwd, protectedFiles, status) => {
+        const stageCmd = protectedFiles.map((f) => `git add "${path.join(cwd, f)}" 2>/dev/null || true`).join("; ");
+        await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd, timeout: 10000 });
+        return `Git: reverted changes (${status}) — autoresearch files preserved`;
+      },
+    };
+  };
+
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
   let spinnerInterval: ReturnType<typeof setInterval> | null = null;
@@ -1362,7 +1524,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const ideasPath = path.join(workDir, "autoresearch.ideas.md");
     const hasIdeas = fs.existsSync(ideasPath);
 
-    let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
+    const historyLabel = getRepoVcs(workDir).historyLabel;
+    let resumeMsg = `Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and ${historyLabel} for context.`;
     if (hasIdeas) {
       resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
     }
@@ -2057,7 +2220,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Log experiment result (commit, metric, status, description)",
     promptGuidelines: [
       "Always call log_experiment after run_experiment to record the result.",
-      "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
+      "log_experiment automatically records kept results in version control and auto-reverts discarded/crashed iterations while preserving autoresearch files. Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
       "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
@@ -2239,38 +2402,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const trailerJson = JSON.stringify(resultData);
           const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
 
-          const execOpts = { cwd: workDir, timeout: 10000 };
-          const addResult = await pi.exec("git", ["add", "-A"], execOpts);
-          if (addResult.code !== 0) {
-            const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+          const keepResult = await getRepoVcs(workDir).keep(workDir, commitMsg);
+          if (keepResult.displayRevision) {
+            experiment.commit = keepResult.displayRevision;
           }
-
-          const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
-          if (diffResult.code === 0) {
-            text += `\n📝 Git: nothing to commit (working tree clean)`;
-          } else {
-            const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
-            const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
-            if (gitResult.code === 0) {
-              const firstLine = gitOutput.split("\n")[0] || "";
-              text += `\n📝 Git: committed — ${firstLine}`;
-
-              try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
-                const newSha = (shaResult.stdout || "").trim();
-                if (newSha && newSha.length >= 7) {
-                  experiment.commit = newSha;
-                }
-              } catch {
-                // Keep the original commit hash if rev-parse fails
-              }
-            } else {
-              text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
-            }
-          }
+          text += `\n📝 ${keepResult.message}`;
         } catch (e) {
-          text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+          text += `\n⚠️ Version-control keep error: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
@@ -2293,11 +2431,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.status !== "keep") {
         try {
           const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+          const discardMessage = await getRepoVcs(workDir).discard(workDir, protectedFiles, params.status);
+          text += `\n📝 ${discardMessage}`;
         } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          text += `\n⚠️ Version-control revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 

@@ -11,14 +11,16 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 - **`init_experiment`** — configure session (name, metric, unit, direction). Call again to re-initialize with a new baseline when the optimization target changes.
 - **`run_experiment`** — runs command, times it, captures output.
-- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Dashboard: ctrl+x.
+- **`log_experiment`** — records result. `keep` records the kept iteration in version control. `discard`/`crash`/`checks_failed` auto-revert code changes (autoresearch files preserved). Always include secondary `metrics` dict. Dashboard: ctrl+x.
 
 ## Setup
 
 1. Ask (or infer): **Goal**, **Command**, **Metric** (+ direction), **Files in scope**, **Constraints**.
-2. `git checkout -b autoresearch/<goal>-<date>`
+2. Set up an isolated version-control lane for the experiments.
+   - In repos containing `.jj/`, treat the repo as **jj-first**. Create or use a fresh jj change with a clear description for the autoresearch session.
+   - Otherwise, in git repos, create a branch like `autoresearch/<goal>-<date>`.
 3. Read the source files. Understand the workload deeply before writing anything.
-4. Write `autoresearch.md` and `autoresearch.sh` (see below). Commit both.
+4. Write `autoresearch.md` and `autoresearch.sh` (see below). Record both in version control before the loop starts.
 5. `init_experiment` → run baseline → `log_experiment` → start looping immediately.
 
 ### `autoresearch.md`
@@ -86,7 +88,7 @@ Use `log_experiment`'s `asi` parameter to annotate each run with **whatever woul
 JSON config file that lives in the pi session's working directory (`ctx.cwd`). Supported fields:
 
 - **`maxIterations`** (number) — maximum experiments before auto-stopping.
-- **`workingDir`** (string) — override the directory for all autoresearch operations: file I/O (`autoresearch.jsonl`, `autoresearch.md`, `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.ideas.md`), command execution, and git operations. Supports absolute paths or relative paths (resolved against `ctx.cwd`). The config file itself always stays in `ctx.cwd`. Fails if the directory doesn't exist.
+- **`workingDir`** (string) — override the directory for all autoresearch operations: file I/O (`autoresearch.jsonl`, `autoresearch.md`, `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.ideas.md`), command execution, and version-control operations. Supports absolute paths or relative paths (resolved against `ctx.cwd`). The config file itself always stays in `ctx.cwd`. Fails if the directory doesn't exist.
 
 ```json
 {
@@ -129,7 +131,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
-- **Resuming:** if `autoresearch.md` exists, read it + git log, continue looping.
+- **Resuming:** if `autoresearch.md` exists, read it plus recent VCS history (`jj log` in jj repos, `git log` otherwise), then continue looping.
 
 **NEVER STOP.** The user may be away for hours. Keep going until interrupted.
 
